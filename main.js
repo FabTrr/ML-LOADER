@@ -1,206 +1,328 @@
-//CONSTANTES CON API KEYS 
+// ==========================================
+// 1. CONFIGURACIÓN Y CONSTANTES (CRITICAL)
+// ==========================================
+// =====================================
+// 2. GESTIÓN DE TOKENS (AUTORIZACIÓN)
+// =====================================
 
-function doPost(e) {
-  try {
-    if (!e || !e.postData || !e.postData.contents) {
-      return ContentService.createTextOutput("No data");
-    }
-
-    Logger.log("RAW: " + e.postData.contents);
-    const body = JSON.parse(e.postData.contents);
-
-    //solo se procesa la venta
-    if (body.topic !== "orders" && body.topic !== "orders_v2") {
-      return ContentService.createTextOutput("Topic ignorado");
-    }
-
-    let orderId = body.resource || "";
-    orderId = orderId.replace("/orders/", "").replace(/\//g, "");
-
-    Logger.log("🧾 Order ID limpio: " + orderId);
-
-    processOrder(orderId);
-
-    return ContentService.createTextOutput("OK");
-
-  } catch (error) {
-    Logger.log("Error en doPost: " + error.message);
-    return ContentService.createTextOutput("ERROR");
-  }
-}
-
+// Recibe el código de autorización la primera vez
 function doGet(e) {
-  if (!e || !e.parameter || !e.parameter.code) {
-    return ContentService.createTextOutput("OK");
-  }
-
+  if (!e || !e.parameter || !e.parameter.code) return ContentService.createTextOutput("OK");
   const code = e.parameter.code;
   const props = PropertiesService.getScriptProperties();
-  const response = UrlFetchApp.fetch(
-    "https://api.mercadolibre.com/oauth/token",
-    {
-      method: "post",
-      payload: {
-        grant_type: "authorization_code",
-        client_id: ML_CLIENT_ID,
-        client_secret: ML_CLIENT_SECRET,
-        code: code,
-        redirect_uri: ML_REDIRECT_URI
-      }
-    }
-  );
-
-  const data = JSON.parse(response.getContentText());
-
+  
+  const response = UrlFetchApp.fetch("https://api.mercadolibre.com/oauth/token", {
+    method: "post",
+    payload: {
+      grant_type: "authorization_code",
+      client_id: ML_CLIENT_ID,
+      client_secret: ML_CLIENT_SECRET,
+      code: code,
+      redirect_uri: ML_REDIRECT_URI
+    },
+    muteHttpExceptions: true // Agregado por seguridad
+  });
+  
+  const resCode = response.getResponseCode();
+  const resText = response.getContentText();
+  
+  if (resCode !== 200) {
+    return ContentService.createTextOutput("Error al autorizar inicial: " + resText);
+  }
+  
+  const data = JSON.parse(resText);
   props.setProperty("ML_ACCESS_TOKEN", data.access_token);
   props.setProperty("ML_REFRESH_TOKEN", data.refresh_token);
   props.setProperty("ML_TOKEN_EXP", (Date.now() + data.expires_in * 1000).toString());
-
-  return ContentService.createTextOutput("Tokens guardados correctamente");
+  
+  return ContentService.createTextOutput("Tokens guardados correctamente de forma inicial.");
 }
 
+// Obtiene el token activo o lo renueva si expiró (Versión Segura)
 function getAccessToken() {
   const props = PropertiesService.getScriptProperties();
-
   const accessToken = props.getProperty("ML_ACCESS_TOKEN");
   const refreshToken = props.getProperty("ML_REFRESH_TOKEN");
   const exp = Number(props.getProperty("ML_TOKEN_EXP"));
 
-  // Si todavía es válido (dejamos 1 min de margen)
+  // 1. Si el token actual sigue siendo valido (con un margen de 1 minuto), lo usamos
   if (accessToken && exp && Date.now() < exp - 60000) {
     return accessToken;
   }
-  
+
+  // 2. Si no hay refresh_token guardado, lanzamos error claro
   if (!refreshToken) {
-    throw new Error("Falta refresh_token. Reautorizar.");
+    throw new Error("Falta ML_REFRESH_TOKEN en las propiedades del script. Es necesario reautorizar la App.");
   }
 
-  // Renovar token
-  const response = UrlFetchApp.fetch(
-    "https://api.mercadolibre.com/oauth/token",
-    {
-      method: "post",
-      payload: {
-        grant_type: "refresh_token",
-        client_id: ML_CLIENT_ID,
-        client_secret: ML_CLIENT_SECRET,
-        refresh_token: refreshToken
-      },
-      muteHttpExceptions: true
+  Logger.log("🔄 El Access Token expiró o está por expirar. Intentando renovar con Refresh Token...");
+
+  // 3. Intentamos la renovacion en Mercado Libre
+  const response = UrlFetchApp.fetch("https://api.mercadolibre.com/oauth/token", {
+    method: "post",
+    payload: {
+      grant_type: "refresh_token",
+      client_id: ML_CLIENT_ID,
+      client_secret: ML_CLIENT_SECRET,
+      refresh_token: refreshToken
+    },
+    muteHttpExceptions: true // Evita que Apps Script colapse si la API da error
+  });
+
+  const resCode = response.getResponseCode();
+  const resText = response.getContentText();
+
+  // 4. VALIDACIÓN CRÍTICA: Si ML no responde con 200 OK, NO pisamos las variables antiguas
+  if (resCode !== 200) {
+    Logger.log(`❌ Error de ML al renovar token (Código ${resCode}): ${resText}`);
+    // Si el error dice explícitamente que el refresh token es inválido, lanzamos alerta
+    if (resText.includes("invalid_grant")) {
+      throw new Error("El Refresh Token fue revocado o expiró. Debes volver a vincular la cuenta mediante la URL de autorización.");
     }
-  );
-
-  const responseText = response.getContentText();
-  const data = JSON.parse(responseText);
-
-  if (response.getResponseCode() !== 200 || !data.access_token) {
-    Logger.log("Error renovando token: " + responseText);
-    throw new Error("No se pudo renovar el token.");
+    // Si fue un error temporal de ML (500, timeout), devolvemos el token viejo por si acaso sirve
+    if (accessToken) return accessToken;
+    throw new Error("Error temporal de comunicación con Mercado Libre. Reintentar más tarde.");
   }
 
-  props.setProperty("ML_ACCESS_TOKEN", data.access_token);
-  props.setProperty("ML_REFRESH_TOKEN", data.refresh_token);
-  props.setProperty("ML_TOKEN_EXP", (Date.now() + data.expires_in * 1000).toString());
-
-  Logger.log("Access token renovado con éxito");
+  // 5. Si todo salió bien (200 OK), guardamos los nuevos valores seguros de que existen
+  const data = JSON.parse(resText);
   
-  return data.access_token;
+  if (data.access_token && data.refresh_token) {
+    props.setProperty("ML_ACCESS_TOKEN", data.access_token);
+    props.setProperty("ML_REFRESH_TOKEN", data.refresh_token);
+    props.setProperty("ML_TOKEN_EXP", (Date.now() + data.expires_in * 1000).toString());
+    Logger.log("✅ Token renovado con éxito.");
+    return data.access_token;
+  } else {
+    throw new Error("La respuesta de ML fue exitosa pero no contenía los tokens esperados.");
+  }
 }
+// ==========================================
+// 4. PROCESAMIENTO DE LÓGICA
+// ==========================================
 
-// ==========================================
-//  INSERCION EN PLANILLA GOOGLE
-// ==========================================
 function insertarEnPlanilla(orderData) {
   try {
-    Logger.log("Iniciando inserción detallada para venta: " + orderData.id);
-
-    if (!orderData || !orderData.buyer) return;
-
-    const sheet = SpreadsheetApp.openById(SPREADSHEET_ID).getSheetByName(SHEET_NAME);
-    const firstName = orderData.buyer?.first_name || "";
-    const lastName = orderData.buyer?.last_name || "";
-    const nickname = orderData.buyer?.nickname || "";
-    const nombreReal = (firstName || lastName) ? `${firstName} ${lastName}`.trim() : nickname;
-
-    let items = [];
-    if (orderData.order_items && orderData.order_items.length > 0) {
-      items = orderData.order_items;
-    } else if (orderData.orders && orderData.orders.length > 0) {
-      orderData.orders.forEach(o => {
-        if (o.order_items) items = items.concat(o.order_items);
-      });
-    }
-    
-    const productosDetalle = items.length > 0 ? items.map(item => {
-      const qty = item.quantity || 1;
-      const title = item.item?.title || "Producto";
-      const price = item.unit_price || 0;
-      const subtotal = qty * price;
-      const sku = item.item?.seller_sku || item.item?.id || "S/N";
-      return `${qty} x ${title} SKU: ${sku} = $${subtotal}`;
-    }).join(" | ") : " ERROR: No se recuperó detalle"; 
-
-    
-    let envio = "Envío a acordar"; 
     const shippingId = orderData.shipping?.id || "";
-    
-    if (shippingId && shippingId !== "No ID") {
-      try {
-        const token = getAccessToken();
-        const shipRes = UrlFetchApp.fetch(`https://api.mercadolibre.com/shipments/${shippingId}`, {
-          headers: { Authorization: `Bearer ${token}` },
-          muteHttpExceptions: true
-        });
-        if (shipRes.getResponseCode() === 200) {
-          const shipData = JSON.parse(shipRes.getContentText());
-          const logistic = (shipData.logistic_type || "").toLowerCase();
-          if (logistic.includes("flex") || logistic.includes("self_service")) {
-            envio = "Mercadoenvíos FLEX *";
-          } else {
-            envio = "Mercadoenvíos (Colecta)";
-          }
-        }
-      } catch (e) { envio = "MercadoEnvíos"; }
+    // Filtro: Si no hay envío o es "A acordar", detenemos el proceso
+    if (!shippingId || shippingId === "No ID") return;
+
+    // 1. Definimos el formato de cada ítem una sola vez
+    const formatItem = (i) => {
+      const qty = i.quantity || 1;
+      const title = i.item?.title || "Producto";
+      const unitPrice = i.unit_price || 0;
+      
+      // Extraemos el SKU. Si el producto no tiene SKU en ML, lo dejamos en blanco
+      const sku = i.item?.seller_sku ? ` SKU: ${i.item.seller_sku}` : "";
+      
+      // Ajustamos el formato agregando el SKU y el signo de igual para ventas simples
+      if (qty >= 2) {
+        return `${qty} x ${title}${sku} (${qty} x $${unitPrice})`;
+      } else {
+        return `${qty} x ${title}${sku} = $${unitPrice}`;
+      }
+    };
+
+    // 2. Construimos el Detalle del Pedido
+    let detalleFinal = "";
+    if (orderData.esCarrito && orderData.pack_orders) {
+      detalleFinal = orderData.order_items.map(formatItem).join("\n");
+    } else {
+      detalleFinal = orderData.order_items.map(formatItem).join("\n");
     }
 
-    const row = sheet.getLastRow() + 1;
-    
-    sheet.appendRow([
-      new Date(),                           // A (1) Marca temporal
-      "ML_LOADER",                          // B (2) Responsable
-      nombreReal,                           // C (3) Cliente
-      "MercadoLibre",                       // D (4) Canal
-      nickname,                             // E (5) Usuario 
-      "", "", "", "", "",                  // F, G, H, I, J
-      envio,                                // K (11) Envío
-      productosDetalle,                     // L (12) DETALLE
-      "Público",                            // M (13) Precio
-      "MercadoPago",                        // N (14) Forma de pago
-      "'" + "Operación # " + orderData.id,   // O (15) Observaciones
-      "",                                   // P (16) Tecnico Asignado
-      "", ""                                // Q, R
-    ]);
+    // 3. Consultar tipo de envío exacto (Flex vs Colecta)
+    let envioTipo = "Mercadoenvíos (Colecta)";
+    try {
+      const token = getAccessToken();
+      const shipRes = UrlFetchApp.fetch(`https://api.mercadolibre.com/shipments/${shippingId}`, {
+        headers: { Authorization: `Bearer ${token}` },
+        muteHttpExceptions: true
+      });
+      
+      if (shipRes.getResponseCode() === 200) {
+        const logistic = (JSON.parse(shipRes.getContentText()).logistic_type || "").toLowerCase();
+        if (logistic.includes("flex") || logistic.includes("self_service")) {
+          envioTipo = "Mercadoenvíos FLEX *";
+        }
+      }
+    } catch (e) {
+      Logger.log("Error al consultar logística: " + e.message);
+    }
 
-  /*  const textoNota = `Pedido Nº: ${row}`;
-    crearNotaEnMercadoLibre(orderData.id, textoNota);
-*/
-    Logger.log(`Insertado con éxito en planilla en fila ${row} y enviada nota a ML.`);
+    // 4. Enviar los datos procesados al Formulario
+    enviarAFormulario(orderData, detalleFinal, envioTipo);
 
   } catch (err) {
     Logger.log("Error en insertarEnPlanilla: " + err.message);
   }
 }
 
-// FUNCIÓN DE APOYO PARA CREAR LA NOTA EN MERCADOLIBRE
-/*
+function enviarAFormulario(orderData, detalleFinal, envioDetectado) {
+  const form = FormApp.openById(FORM_ID);
+  const items = form.getItems();
+  const response = form.createResponse();
+
+  // 1. Extraer datos del comprador
+  const nombre = ((orderData.buyer.first_name || "") + " " + (orderData.buyer.last_name || "")).trim() || orderData.buyer.nickname;
+  const tel = orderData.buyer.phone ? `${orderData.buyer.phone.area_code} ${orderData.buyer.phone.number}` : "";
+
+  // 2. Extraer el RUT (Búsqueda avanzada con Endpoint de Facturación MLU + Fallbacks)
+  let rutDetectado = "";
+  const tokenParaProduccion = getAccessToken();
+  
+  // Estrategia Principal: Buscar el billing_info.id exclusivo de facturación
+  let idFiscal = buscarBillingInfoId(orderData);
+  if (!idFiscal && orderData.raw_pack_data) {
+    idFiscal = buscarBillingInfoId(orderData.raw_pack_data);
+  }
+  
+  if (idFiscal) {
+    rutDetectado = consultarEndpointBillingInfo(idFiscal, tokenParaProduccion);
+  }
+
+  // Fallback A: Revisar el documento principal de la cuenta (buyer.document)
+  if (!rutDetectado && orderData.buyer && orderData.buyer.document) {
+    const tipoDoc = (orderData.buyer.document.type || "").toUpperCase();
+    if (tipoDoc.includes("RUT")) {
+      rutDetectado = orderData.buyer.document.number;
+    }
+  }
+
+  // Fallback B: Revisar en los datos estáticos clásicos de la orden (billing)
+  if (!rutDetectado && orderData.billing && orderData.billing.billing_info) {
+    const info = orderData.billing.billing_info;
+    const tipoDoc = (info.doc_type || "").toUpperCase();
+    if (tipoDoc.includes("RUT")) {
+      rutDetectado = info.doc_number;
+    }
+  }
+
+  // Fallback C: Plan de rescate por Regex en los nombres/nickname
+  if (!rutDetectado) {
+    const datosTexto = `${orderData.buyer?.nickname || ""} ${orderData.buyer?.first_name || ""} ${orderData.buyer?.last_name || ""}`;
+    const regexRUT = /R\.?U\.?T\.?[^\d]*(\d{11,12})/i;
+    const match = datosTexto.match(regexRUT);
+    if (match && match[1]) {
+      rutDetectado = match[1];
+      Logger.log(`🔍 RUT detectado por Regex en el nombre/nickname: ${rutDetectado}`);
+    }
+  }
+
+  // 3. Definir qué va en Observaciones (Vital para no duplicar carritos)
+  const obsTexto = orderData.esCarrito ? orderData.id : "Operación #" + orderData.id;
+
+  // 4. Mapeo de respuestas al Formulario
+  response.withItemResponse(items[0].asListItem().createResponse("Fabiana"));
+  response.withItemResponse(items[1].asTextItem().createResponse(nombre));
+  response.withItemResponse(items[2].asMultipleChoiceItem().createResponse("Mercadolibre"));
+  response.withItemResponse(items[3].asTextItem().createResponse(orderData.buyer.nickname));
+  response.withItemResponse(items[4].asTextItem().createResponse(rutDetectado));
+  response.withItemResponse(items[5].asTextItem().createResponse(tel));
+  response.withItemResponse(items[6].asTextItem().createResponse(orderData.shipping?.receiver_address?.address_line || ""));
+  response.withItemResponse(items[7].asTextItem().createResponse(orderData.shipping?.receiver_address?.city?.name || ""));
+  response.withItemResponse(items[8].asTextItem().createResponse("")); // Agencia
+  response.withItemResponse(items[9].asMultipleChoiceItem().createResponse(envioDetectado));
+  response.withItemResponse(items[10].asParagraphTextItem().createResponse(detalleFinal));
+  response.withItemResponse(items[11].asMultipleChoiceItem().createResponse("Público"));
+  response.withItemResponse(items[12].asMultipleChoiceItem().createResponse("Mercadopago"));
+  response.withItemResponse(items[13].asTextItem().createResponse(obsTexto));
+
+  // ==========================================
+  // 5. CÁLCULO DE FILA Y CREACIÓN DE NOTA (Escaneo Real)
+  // ==========================================
+  
+  const sheet = SpreadsheetApp.openById(SPREADSHEET_ID).getSheetByName(SHEET_NAME);
+  
+  // Obtenemos la última fila que Sheets "cree" que tiene datos (ej: 3580 por formatos/fórmulas)
+  const filaFalsa = sheet.getLastRow();
+  
+  // Leemos específicamente la columna 15 (Observaciones) de arriba hacia abajo
+  let ultimaFilaReal = 1;
+  if (filaFalsa > 0) {
+    const valoresObservaciones = sheet.getRange(1, 15, filaFalsa, 1).getValues();
+    
+    // Escaneamos de abajo hacia arriba buscando el primer texto real (ignorando celdas vacías)
+    for (let i = valoresObservaciones.length - 1; i >= 0; i--) {
+      if (valoresObservaciones[i][0].toString().trim() !== "") {
+        ultimaFilaReal = i + 1; // Encontramos la fila con la última venta
+        break;
+      }
+    }
+  }
+  
+  // Calculamos la fila exacta en la que Forms va a insertar el nuevo pedido
+  const numeroPedido = ultimaFilaReal + 1; 
+  const textoNota = `Pedido ${numeroPedido}`;
+
+  // ENVIAMOS EL FORMULARIO
+  response.submit();
+  Logger.log(`✅ Formulario enviado. Orden: ${orderData.id} | Fila destino real: ${numeroPedido} | RUT: ${rutDetectado || "No detectado"}`);
+
+  // Creamos la nota en Mercado Libre usando el número calculado
+  try {
+    if (orderData.esCarrito && orderData.pack_orders) {
+      orderData.pack_orders.forEach(ordenHija => {
+        crearNotaEnMercadoLibre(ordenHija.id, textoNota);
+      });
+    } else {
+      crearNotaEnMercadoLibre(orderData.id, textoNota);
+    }
+  } catch (err) {
+    Logger.log("Error al intentar insertar la nota en Mercado Libre: " + err.message);
+  }
+}
+
+// ==========================================
+// FUNCIONES DE APOYO EXCLUSIVAS PARA FACTURACIÓN
+// ==========================================
+
+function buscarBillingInfoId(obj) {
+  if (!obj) return null;
+  if (obj.billing_info && obj.billing_info.id) return obj.billing_info.id;
+  if (obj.billing && obj.billing.billing_info && obj.billing.billing_info.id) return obj.billing.billing_info.id;
+  if (obj.billing && obj.billing.id) return obj.billing.id;
+  if (obj.buyer && obj.buyer.billing_info && obj.buyer.billing_info.id) return obj.buyer.billing_info.id;
+  
+  if (obj.orders && obj.orders.length > 0) {
+    const primeraOrden = obj.orders[0];
+    if (primeraOrden.billing && primeraOrden.billing.billing_info && primeraOrden.billing.billing_info.id) return primeraOrden.billing.billing_info.id;
+    if (primeraOrden.billing && primeraOrden.billing.id) return primeraOrden.billing.id;
+  }
+  return null;
+}
+
+function consultarEndpointBillingInfo(billingInfoId, token) {
+  try {
+    const url = `https://api.mercadolibre.com/orders/billing-info/MLU/${billingInfoId}`;
+    const options = {
+      "method": "get",
+      "headers": { "Authorization": `Bearer ${token}` },
+      "muteHttpExceptions": true
+    };
+    
+    const response = UrlFetchApp.fetch(url, options);
+    if (response.getResponseCode() === 200) {
+      const resData = JSON.parse(response.getContentText());
+      if (resData.doc_type && resData.doc_type.toUpperCase().includes("RUT") && resData.doc_number) {
+        return resData.doc_number.toString().trim();
+      }
+      if (resData.identification && resData.identification.type && resData.identification.type.toUpperCase().includes("RUT")) {
+        return resData.identification.number.toString().trim();
+      }
+    }
+  } catch (e) {
+    Logger.log(`⚠️ Excepción en consultarEndpointBillingInfo: ${e.message}`);
+  }
+  return "";
+}
+
 function crearNotaEnMercadoLibre(orderId, textoNota) {
   const token = getAccessToken();
   const url = `https://api.mercadolibre.com/orders/${orderId}/notes`;
   
-  const payload = {
-    "note": textoNota
-  };
-
+  const payload = { "note": textoNota };
   const options = {
     "method": "post",
     "headers": {
@@ -214,7 +336,6 @@ function crearNotaEnMercadoLibre(orderId, textoNota) {
   try {
     const res = UrlFetchApp.fetch(url, options);
     const code = res.getResponseCode();
-    
     if (code === 200 || code === 201) {
       Logger.log(`Nota creada en MercadoLibre para orden ${orderId}`);
     } else {
@@ -224,133 +345,60 @@ function crearNotaEnMercadoLibre(orderId, textoNota) {
     Logger.log(`Error de conexión al crear nota en ML: ${e.message}`);
   }
 }
-*/
+
+// ==========================================
+// FUNCIONES DE APOYO (API ML)
+// ==========================================
+
 function processOrder(id, intento = 1) {
-  const MAX_INTENTOS = 5;
   const token = getAccessToken();
+  const r = UrlFetchApp.fetch(`https://api.mercadolibre.com/orders/${id}`, {
+    headers: { Authorization: `Bearer ${token}` },
+    muteHttpExceptions: true
+  });
 
-  const r = UrlFetchApp.fetch(
-    `https://api.mercadolibre.com/orders/${id}`,
-    {
-      headers: { Authorization: `Bearer ${token}` },
-      muteHttpExceptions: true
-    }
-  );
-
-  const code = r.getResponseCode();
-  const bodyText = r.getContentText();
-
-  Logger.log(`processOrder ${id} → HTTP ${code}`);
-
-  if (code === 200) {
-    return procesarOrdenReal(JSON.parse(bodyText));
-  }
-
-  if (code === 400) {
-    const body = JSON.parse(bodyText);
+  if (r.getResponseCode() === 200) return insertarEnPlanilla(JSON.parse(r.getContentText()));
+  
+  if (r.getResponseCode() === 400) {
+    const body = JSON.parse(r.getContentText());
     if (body.error === "order_belong_pack") {
-      const packId = (body.cause && body.cause.length > 0) ? body.cause[0] : null;
-      if (packId) {
-        Logger.log(`Detectado Pack: ${packId}. Procesando...`);
-        return processPack(packId, id); 
-      }
+      const packId = body.cause?.[0];
+      if (packId) return processPack(packId, id);
     }
-  }
-
-  if (code === 404 && intento < MAX_INTENTOS) {
-    Logger.log(`404 en ${id}, reintentando ${intento}...`);
-    Utilities.sleep(6000);
-    return processOrder(id, intento + 1);
   }
 }
 
 function processPack(packId, originalOrderId) {
   const token = getAccessToken();
-  let packData = null;
-
-  const endpoints = [
-    `https://api.mercadolibre.com/packs/${packId}`,
-    `https://api.mercadolibre.com/orders/packs/${packId}`
-  ];
-
-  for (let url of endpoints) {
-    const res = UrlFetchApp.fetch(url, {
-      headers: { Authorization: `Bearer ${token}` },
-      muteHttpExceptions: true
-    });
-    if (res.getResponseCode() === 200) {
-      packData = JSON.parse(res.getContentText());
-      break;
-    }
-  }
-
-  let orderBase = null;
-  if (packData && packData.orders && packData.orders.length > 0) {
-    orderBase = packData.orders[0];
-  }
-
-  if (!packData || !orderBase || !orderBase.buyer) {
-    Logger.log("Pack incompleto. Buscando detalles en la orden individual...");
-    const resOrder = UrlFetchApp.fetch(`https://api.mercadolibre.com/orders/${originalOrderId}`, {
-      headers: { Authorization: `Bearer ${token}` },
-      muteHttpExceptions: true
-    });
-    if (resOrder.getResponseCode() === 200) {
-      orderBase = JSON.parse(resOrder.getContentText());
-    }
-  }
-
-  if (!orderBase || !orderBase.buyer) {
-    Logger.log("Imposible recuperar datos del comprador para el pack " + packId);
-    return;
-  }
-
-  let todosLosItems = [];
-  if (packData && packData.orders) {
-    packData.orders.forEach(o => {
-      if (o.order_items) todosLosItems = todosLosItems.concat(o.order_items);
-    });
-  }
+  const res = UrlFetchApp.fetch(`https://api.mercadolibre.com/packs/${packId}`, {
+    headers: { Authorization: `Bearer ${token}` },
+    muteHttpExceptions: true
+  });
   
-  if (todosLosItems.length === 0) {
-    todosLosItems = orderBase.order_items || [];
-  }
+  if (res.getResponseCode() !== 200) return;
+  const packData = JSON.parse(res.getContentText());
+  const orderBase = packData.orders[0];
 
-  const shippingConsolidado = (packData?.shipments && packData.shipments.length > 0) 
-                              ? packData.shipments[0] 
-                              : orderBase.shipping;
+  const todosLosIds = packData.orders.map(o => `Operación #${o.id}`).join(" ");
 
   const ordenConsolidada = {
-    id: packId,
+    id: todosLosIds,
     esCarrito: true,
     buyer: orderBase.buyer,
-    shipping: shippingConsolidado,
-    order_items: todosLosItems,
-    total_amount: packData?.orders ? packData.orders.reduce((acc, o) => acc + (o.total_amount || 0), 0) : orderBase.total_amount,
-    payments: packData?.payments || orderBase.payments || []
+    billing: orderBase.billing,
+    shipping: packData?.shipments?.[0] || orderBase.shipping,
+    order_items: packData.orders.flatMap(o => o.order_items || []),
+    pack_orders: packData.orders,
+    raw_pack_data: packData // Resguardamos la estructura cruda por si el ID de facturación vive ahí
   };
 
-  procesarOrdenReal(ordenConsolidada);
-}
-
-
-function procesarOrdenReal(order) {
-  if (!order || !order.buyer || !order.order_items) {
-    Logger.log("Orden descartada por falta de datos esenciales.");
-    return;
-  }
-  
-  insertarEnPlanilla(order);
-}
-
-function testInsertarOrden() {
-  processOrder("xxxxxxxxxxxxxxxxxx");
+  insertarEnPlanilla(ordenConsolidada);
 }
 
 function consultarOrdenesRecientes() {
   const token = getAccessToken();
   const SELLER_ID = "31554658"; 
-  const url = `https://api.mercadolibre.com/orders/search?seller=${SELLER_ID}&sort=date_desc&limit=10`;
+  const url = `https://api.mercadolibre.com/orders/search?seller=${SELLER_ID}&sort=date_desc&limit=2`;
   
   const options = {
     "method": "get",
@@ -375,26 +423,72 @@ function consultarOrdenesRecientes() {
     
     let idsExistentes = [];
     if (lastRow > 1) {
-      idsExistentes = sheet.getRange(2, 15, lastRow - 1, 1)
-                           .getValues()
-                           .map(fila => {
-                             let textoCelda = fila[0].toString();
-                             return textoCelda.replace("Operación #", "").trim();
-                           });
+      const valoresCeldas = sheet.getRange(2, 15, lastRow - 1, 1).getValues();
+      idsExistentes = valoresCeldas.map(fila => {
+        let textoCelda = fila[0].toString();
+        return textoCelda.replace(/\D/g, "").trim();
+      });
     }
     
+    const ORDENES_SALTADAS = ["2000012958653253","2000012955238577","2000012949571057"];
     ordenes.forEach(orden => {
-      const orderIdStr = orden.id.toString();
+      const orderIdStr = orden.id.toString().replace(/\D/g, "").trim();
+      
+      if (ORDENES_SALTADAS.includes(orderIdStr)) {
+        Logger.log(`🚫 Orden excluida manualmente: ${orderIdStr}. Saltando...`);
+        return;
+      }
       
       if (idsExistentes.indexOf(orderIdStr) === -1) {
-        Logger.log(`Nueva orden detectada: ${orderIdStr}.`);
+        Logger.log(`🆕 Nueva orden detectada: ${orderIdStr}.`);
         processOrder(orderIdStr); 
       } else {
-        Logger.log(`Skip: La orden ${orderIdStr} ya existe.`);
+        Logger.log(`Skip: La orden ${orderIdStr} ya existe en los registros.`);
       }
     });
     
   } catch (error) {
     Logger.log("Error en consultarOrdenesRecientes: " + error.message);
+  }
+}
+
+function cargarPedidosManuales() {
+  const pedidosParaCargar = [
+
+"2000016831487436",
+"2000016831387042",
+"2000016831363978",
+"2000016831356766",
+"2000016831183852",
+"2000016831161462"
+
+  ];
+
+  try {
+    const sheet = SpreadsheetApp.openById(SPREADSHEET_ID).getSheetByName(SHEET_NAME);
+    const lastRow = sheet.getLastRow();
+    
+    let observacionesGuardadas = [];
+    if (lastRow > 1) {
+      observacionesGuardadas = sheet.getRange(2, 15, lastRow - 1, 1).getValues().map(fila => fila[0].toString());
+    }
+
+    pedidosParaCargar.forEach(orderId => {
+      const orderIdStr = orderId.toString().trim();
+      const yaExiste = observacionesGuardadas.some(textoCelda => textoCelda.includes(orderIdStr));
+      
+      if (!yaExiste) {
+        Logger.log(`⚙️ Ejecutando carga manual para la orden: ${orderIdStr}`);
+        processOrder(orderIdStr);
+        Utilities.sleep(2000); 
+      } else {
+        Logger.log(`⚠️ Skip: La orden ${orderIdStr} ya existe en la planilla. Se omite para no duplicar.`);
+      }
+    });
+    
+    Logger.log("✅ Proceso de carga manual finalizado.");
+
+  } catch (error) {
+    Logger.log("Error en la carga manual: " + error.message);
   }
 }
